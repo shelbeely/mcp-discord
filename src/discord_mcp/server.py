@@ -1,7 +1,8 @@
+# server.py
 import os
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta # Added timedelta
 from typing import Any, Dict, List, Optional
 from functools import wraps
 
@@ -249,6 +250,9 @@ async def list_tools() -> List[Tool]:
                 "required": ["channel_id", "message_id", "emoji"]
             }
         ),
+
+        # *** MODIFIED SECTION START ***
+        # Message Sending Tools
         Tool(
             name="send_message",
             description="Send a message to a specific channel",
@@ -267,6 +271,26 @@ async def list_tools() -> List[Tool]:
                 "required": ["channel_id", "content"]
             }
         ),
+        Tool( # New tool for DMs
+            name="send_dm",
+            description="Send a direct message (DM) to a specific user",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "Discord user ID to send DM to"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Message content"
+                    }
+                },
+                "required": ["user_id", "content"]
+            }
+        ),
+        # *** MODIFIED SECTION END ***
+
         Tool(
             name="read_messages",
             description="Read recent messages from a channel",
@@ -335,14 +359,71 @@ async def list_tools() -> List[Tool]:
 @require_discord_client
 async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     """Handle Discord tool calls."""
-    
+
+    # *** MODIFIED SECTION START ***
     if name == "send_message":
-        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
-        message = await channel.send(arguments["content"])
-        return [TextContent(
-            type="text",
-            text=f"Message sent successfully. Message ID: {message.id}"
-        )]
+        try:
+            channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+            if isinstance(channel, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.Thread)): # Check if it's a sendable channel type
+                message = await channel.send(arguments["content"])
+                return [TextContent(
+                    type="text",
+                    text=f"Message sent successfully to channel #{channel.name}. Message ID: {message.id}"
+                )]
+            else:
+                return [TextContent(
+                    type="text",
+                    text=f"Error: Channel ID {arguments['channel_id']} is not a valid text-based channel."
+                )]
+        except discord.NotFound:
+             return [TextContent(
+                type="text",
+                text=f"Error: Discord channel with ID {arguments['channel_id']} not found."
+            )]
+        except discord.Forbidden:
+            return [TextContent(
+                type="text",
+                text=f"Error: Bot does not have permission to send messages in channel {arguments['channel_id']}."
+            )]
+        except Exception as e:
+            logger.error(f"Error sending channel message: {e}")
+            return [TextContent(
+                type="text",
+                text=f"An unexpected error occurred while sending the message: {e}"
+            )]
+
+    elif name == "send_dm":
+        try:
+            user = await discord_client.fetch_user(int(arguments["user_id"]))
+            if user:
+                message = await user.send(arguments["content"])
+                return [TextContent(
+                    type="text",
+                    text=f"DM sent successfully to {user.name}. Message ID: {message.id}"
+                )]
+            else:
+                # This case might be redundant due to fetch_user raising NotFound, but kept for robustness
+                return [TextContent(
+                    type="text",
+                    text=f"Error: Could not find user with ID {arguments['user_id']}"
+                )]
+        except discord.NotFound:
+             return [TextContent(
+                type="text",
+                text=f"Error: Discord user with ID {arguments['user_id']} not found."
+            )]
+        except discord.Forbidden:
+            return [TextContent(
+                type="text",
+                text=f"Error: Cannot send DM to user {arguments['user_id']}. They might have DMs disabled, blocked the bot, or the bot might not share a server with them."
+            )]
+        except Exception as e:
+            logger.error(f"Error sending DM: {e}")
+            return [TextContent(
+                type="text",
+                text=f"An unexpected error occurred while sending the DM: {e}"
+            )]
+    # *** MODIFIED SECTION END ***
 
     elif name == "read_messages":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
@@ -357,7 +438,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                     "emoji": emoji_str,
                     "count": reaction.count
                 }
-                logger.error(f"Emoji: {emoji_str}")
+                # Removed the logger.error line for emoji here as it might be verbose
                 reaction_data.append(reaction_info)
             messages.append({
                 "id": str(message.id),
@@ -368,7 +449,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
             })
         return [TextContent(
             type="text",
-            text=f"Retrieved {len(messages)} messages:\n\n" + 
+            text=f"Retrieved {len(messages)} messages:\n\n" +
                  "\n".join([
                      f"{m['author']} ({m['timestamp']}): {m['content']}\n" +
                      f"Reactions: {', '.join([f'{r['emoji']}({r['count']})' for r in m['reactions']]) if m['reactions'] else 'No reactions'}"
@@ -387,7 +468,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         }
         return [TextContent(
             type="text",
-            text=f"User information:\n" + 
+            text=f"User information:\n" +
                  f"Name: {user_info['name']}#{user_info['discriminator']}\n" +
                  f"ID: {user_info['id']}\n" +
                  f"Bot: {user_info['bot']}\n" +
@@ -395,31 +476,48 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         )]
 
     elif name == "moderate_message":
-        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
-        message = await channel.fetch_message(int(arguments["message_id"]))
-        
-        # Delete the message
-        await message.delete(reason=arguments["reason"])
-        
-        # Handle timeout if specified
-        if "timeout_minutes" in arguments and arguments["timeout_minutes"] > 0:
-            if isinstance(message.author, discord.Member):
-                duration = discord.utils.utcnow() + datetime.timedelta(
-                    minutes=arguments["timeout_minutes"]
-                )
-                await message.author.timeout(
-                    duration,
-                    reason=arguments["reason"]
-                )
-                return [TextContent(
-                    type="text",
-                    text=f"Message deleted and user timed out for {arguments['timeout_minutes']} minutes."
-                )]
-        
-        return [TextContent(
-            type="text",
-            text="Message deleted successfully."
-        )]
+        try:
+            channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+            message = await channel.fetch_message(int(arguments["message_id"]))
+            author = message.author # Store author before deleting message
+
+            # Delete the message
+            await message.delete(reason=arguments["reason"])
+            delete_confirmation = "Message deleted successfully."
+
+            # Handle timeout if specified
+            timeout_confirmation = ""
+            if "timeout_minutes" in arguments and arguments["timeout_minutes"] > 0:
+                if isinstance(author, discord.Member): # Check if author is still in a server (Member, not just User)
+                    # Discord's timeout is relative using timedelta, not absolute datetime
+                    duration = timedelta(minutes=int(arguments["timeout_minutes"]))
+                    await author.timeout(duration, reason=arguments["reason"])
+                    timeout_confirmation = f" User {author.name} timed out for {arguments['timeout_minutes']} minutes."
+                else:
+                     timeout_confirmation = f" Could not time out user (they might have left the server)."
+
+
+            return [TextContent(
+                type="text",
+                text=delete_confirmation + timeout_confirmation
+            )]
+        except discord.NotFound:
+             return [TextContent(
+                type="text",
+                text=f"Error: Message or channel not found."
+            )]
+        except discord.Forbidden:
+             return [TextContent(
+                type="text",
+                text=f"Error: Bot lacks permissions to delete messages or timeout users."
+            )]
+        except Exception as e:
+            logger.error(f"Error moderating message: {e}")
+            return [TextContent(
+                type="text",
+                text=f"An unexpected error occurred during moderation: {e}"
+            )]
+
 
     # Server Information Tools
     elif name == "get_server_info":
@@ -442,8 +540,9 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     elif name == "list_members":
         guild = await discord_client.fetch_guild(int(arguments["server_id"]))
         limit = min(int(arguments.get("limit", 100)), 1000)
-        
+
         members = []
+        # Use fetch_members for intent-based fetching
         async for member in guild.fetch_members(limit=limit):
             members.append({
                 "id": str(member.id),
@@ -452,11 +551,11 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                 "joined_at": member.joined_at.isoformat() if member.joined_at else None,
                 "roles": [str(role.id) for role in member.roles[1:]]  # Skip @everyone
             })
-        
+
         return [TextContent(
             type="text",
-            text=f"Server Members ({len(members)}):\n" + 
-                 "\n".join(f"{m['name']} (ID: {m['id']}, Roles: {', '.join(m['roles'])})" for m in members)
+            text=f"Server Members ({len(members)} fetched, limit {limit}):\n" +
+                 "\n".join(f"{m['name']} (ID: {m['id']}, Nick: {m['nick']}, Roles: {', '.join(m['roles'])})" for m in members)
         )]
 
     # Role Management Tools
@@ -464,7 +563,12 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         guild = await discord_client.fetch_guild(int(arguments["server_id"]))
         member = await guild.fetch_member(int(arguments["user_id"]))
         role = guild.get_role(int(arguments["role_id"]))
-        
+
+        if not role:
+            return [TextContent(type="text", text=f"Error: Role with ID {arguments['role_id']} not found.")]
+        if not member:
+             return [TextContent(type="text", text=f"Error: Member with ID {arguments['user_id']} not found in this server.")]
+
         await member.add_roles(role, reason="Role added via MCP")
         return [TextContent(
             type="text",
@@ -475,7 +579,13 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         guild = await discord_client.fetch_guild(int(arguments["server_id"]))
         member = await guild.fetch_member(int(arguments["user_id"]))
         role = guild.get_role(int(arguments["role_id"]))
-        
+
+        if not role:
+            return [TextContent(type="text", text=f"Error: Role with ID {arguments['role_id']} not found.")]
+        if not member:
+             return [TextContent(type="text", text=f"Error: Member with ID {arguments['user_id']} not found in this server.")]
+
+
         await member.remove_roles(role, reason="Role removed via MCP")
         return [TextContent(
             type="text",
@@ -486,16 +596,23 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     elif name == "create_text_channel":
         guild = await discord_client.fetch_guild(int(arguments["server_id"]))
         category = None
-        if "category_id" in arguments:
-            category = guild.get_channel(int(arguments["category_id"]))
-        
+        if "category_id" in arguments and arguments["category_id"]:
+            try:
+                category = guild.get_channel(int(arguments["category_id"]))
+                if not isinstance(category, discord.CategoryChannel):
+                    return [TextContent(type="text", text=f"Error: Provided category ID {arguments['category_id']} is not a category channel.")]
+                    category = None # Reset if not a valid category
+            except ValueError:
+                 return [TextContent(type="text", text=f"Error: Invalid category ID format {arguments['category_id']}.")]
+
+
         channel = await guild.create_text_channel(
             name=arguments["name"],
             category=category,
             topic=arguments.get("topic"),
             reason="Channel created via MCP"
         )
-        
+
         return [TextContent(
             type="text",
             text=f"Created text channel #{channel.name} (ID: {channel.id})"
@@ -503,10 +620,14 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
 
     elif name == "delete_channel":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        if not channel:
+            return [TextContent(type="text", text=f"Error: Channel with ID {arguments['channel_id']} not found.")]
+
+        channel_name = channel.name # Get name before deleting
         await channel.delete(reason=arguments.get("reason", "Channel deleted via MCP"))
         return [TextContent(
             type="text",
-            text=f"Deleted channel successfully"
+            text=f"Deleted channel #{channel_name} successfully"
         )]
 
     # Message Reaction Tools
@@ -516,35 +637,48 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         await message.add_reaction(arguments["emoji"])
         return [TextContent(
             type="text",
-            text=f"Added reaction {arguments['emoji']} to message"
+            text=f"Added reaction {arguments['emoji']} to message {message.id}"
         )]
 
     elif name == "add_multiple_reactions":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
         message = await channel.fetch_message(int(arguments["message_id"]))
+        added_emojis = []
         for emoji in arguments["emojis"]:
-            await message.add_reaction(emoji)
+            try:
+                await message.add_reaction(emoji)
+                added_emojis.append(emoji)
+            except discord.HTTPException as e:
+                logger.warning(f"Could not add reaction {emoji}: {e}") # Log warning if one fails
         return [TextContent(
             type="text",
-            text=f"Added reactions: {', '.join(arguments['emojis'])} to message"
+            text=f"Attempted to add reactions: {', '.join(arguments['emojis'])}. Successfully added: {', '.join(added_emojis)} to message {message.id}"
         )]
 
     elif name == "remove_reaction":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
         message = await channel.fetch_message(int(arguments["message_id"]))
-        await message.remove_reaction(arguments["emoji"], discord_client.user)
+        # Default to removing the bot's own reaction if no user specified
+        target_user = discord_client.user
+        await message.remove_reaction(arguments["emoji"], target_user)
         return [TextContent(
             type="text",
-            text=f"Removed reaction {arguments['emoji']} from message"
+            text=f"Removed bot's reaction {arguments['emoji']} from message {message.id}"
         )]
 
+    # If no tool name matched
+    logger.warning(f"Unknown tool called: {name}")
     raise ValueError(f"Unknown tool: {name}")
 
 async def main():
     # Start Discord bot in the background
-    asyncio.create_task(bot.start(DISCORD_TOKEN))
-    
+    # Ensure the bot starts and waits for it to be ready before potentially running MCP server logic
+    # This prevents race conditions where MCP tries to use the client before it's logged in.
+    bot_task = asyncio.create_task(bot.start(DISCORD_TOKEN))
+    await bot.wait_until_ready() # Wait until the bot is fully connected and ready
+
     # Run MCP server
+    logger.info("Discord bot ready, starting MCP server...")
     async with stdio_server() as (read_stream, write_stream):
         await app.run(
             read_stream,
@@ -552,5 +686,17 @@ async def main():
             app.create_initialization_options()
         )
 
+    # Ensure bot task is cancelled if MCP server stops
+    bot_task.cancel()
+    try:
+        await bot_task
+    except asyncio.CancelledError:
+        logger.info("Discord bot task cancelled.")
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested.")
+    except Exception as e:
+        logger.exception(f"Critical error running main function: {e}")
